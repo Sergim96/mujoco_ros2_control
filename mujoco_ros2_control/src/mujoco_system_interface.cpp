@@ -24,6 +24,7 @@
 #include <fmt/ranges.h>
 
 #include <unistd.h>
+#include <array>
 #include <cerrno>
 #include <chrono>
 #include <cstdint>
@@ -38,6 +39,8 @@
 #include <mutex>
 #include <new>
 #include <regex>
+#include <set>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -100,6 +103,64 @@ bool is_mimic_joint(const std::string& joint_name, const hardware_interface::Har
     }
   }
   return false;
+}
+
+Eigen::Vector3d parse_sensor_vector3(const hardware_interface::ComponentInfo& sensor, const std::string& key,
+                                     const Eigen::Vector3d& default_value, const bool require_nonnegative = false)
+{
+  const auto parameter = sensor.parameters.find(key);
+  if (parameter == sensor.parameters.end())
+  {
+    return default_value;
+  }
+
+  std::istringstream stream(parameter->second);
+  Eigen::Vector3d result;
+  std::string trailing;
+  if (!(stream >> result.x() >> result.y() >> result.z()) || (stream >> trailing) || !result.allFinite() ||
+      (require_nonnegative && (result.array() < 0.0).any()))
+  {
+    throw std::invalid_argument("Sensor '" + sensor.name + "' parameter '" + key +
+                                "' must contain exactly three " +
+                                (require_nonnegative ? "non-negative " : "finite ") + "numbers");
+  }
+  return result;
+}
+
+double parse_sensor_nonnegative_double(const hardware_interface::ComponentInfo& sensor, const std::string& key,
+                                       const double default_value)
+{
+  const auto parameter = sensor.parameters.find(key);
+  if (parameter == sensor.parameters.end())
+  {
+    return default_value;
+  }
+  std::size_t consumed = 0;
+  const double result = std::stod(parameter->second, &consumed);
+  if (consumed != parameter->second.size() || !std::isfinite(result) || result < 0.0)
+  {
+    throw std::invalid_argument("Sensor '" + sensor.name + "' parameter '" + key +
+                                "' must be one non-negative finite number");
+  }
+  return result;
+}
+
+std::uint64_t parse_sensor_seed(const hardware_interface::ComponentInfo& sensor, const std::string& key,
+                                const std::uint64_t default_value)
+{
+  const auto parameter = sensor.parameters.find(key);
+  if (parameter == sensor.parameters.end())
+  {
+    return default_value;
+  }
+  std::size_t consumed = 0;
+  const auto result = std::stoull(parameter->second, &consumed);
+  if (consumed != parameter->second.size())
+  {
+    throw std::invalid_argument("Sensor '" + sensor.name + "' parameter '" + key +
+                                "' must be one unsigned integer");
+  }
+  return result;
 }
 }  // namespace
 namespace mujoco_ros2_control
@@ -735,6 +796,10 @@ MujocoSystemInterface::on_init(const hardware_interface::HardwareComponentInterf
     RCLCPP_INFO(get_logger(), "No sim_speed set, using the setting from the UI");
   }
 
+  lockstep_ =
+      hardware_interface::parse_bool(get_hardware_parameter(get_hardware_info(), "lockstep").value_or("false"));
+  RCLCPP_INFO(get_logger(), "MuJoCo physics mode: %s", lockstep_ ? "controller lockstep" : "asynchronous");
+
   // Pull the camera publish rate out of the info, if present, otherwise default to 5 hz.
   const auto camera_publish_rate =
       std::stod(get_hardware_parameter(get_hardware_info(), "camera_publish_rate").value_or("5.0"));
@@ -1032,10 +1097,9 @@ MujocoSystemInterface::on_init(const hardware_interface::HardwareComponentInterf
       static_cast<unsigned long>(get_hardware_info().rw_rate));
 #endif
 
-  // When the interface is activated, we start the physics engine.
-  physics_thread_ = std::thread([this, headless]() {
+  auto initialize_simulation = [this, headless]() {
     // Load the simulation and do an initial forward pass
-    RCLCPP_INFO(get_logger(), "Starting the MuJoCo physics thread...");
+    RCLCPP_INFO(get_logger(), "Attaching the MuJoCo model to the simulation...");
     if (headless)
     {
       const std::unique_lock<std::recursive_mutex> lock(*sim_mutex_);
@@ -1051,10 +1115,27 @@ MujocoSystemInterface::on_init(const hardware_interface::HardwareComponentInterf
     {
       const std::unique_lock<std::recursive_mutex> lock(*sim_mutex_);
       mj_forward(mj_model_, mj_data_);
+      mj_copyData(mj_data_control_, mj_model_, mj_data_);
     }
+  };
+
+  if (lockstep_)
+  {
+    // The controller-manager thread will execute one physics step from write().
+    // Initialize synchronously so the first read observes a complete state.
+    initialize_simulation();
+    publish_clock();
+  }
+  else
+  {
+    // In the upstream mode MuJoCo advances independently from ros2_control.
+    physics_thread_ = std::thread([this, initialize_simulation]() {
+      RCLCPP_INFO(get_logger(), "Starting the MuJoCo physics thread...");
+      initialize_simulation();
     // Blocks until terminated
-    PhysicsLoop();
-  });
+      PhysicsLoop();
+    });
+  }
 
   actuator_state_msg_.name.clear();
   for (const auto& actuator : mujoco_actuator_data_)
@@ -1246,6 +1327,14 @@ std::vector<hardware_interface::CommandInterface> MujocoSystemInterface::export_
         {
           new_command_interfaces.emplace_back(joint.name, command_if.name, &joint.effort_interface.command_);
         }
+        else if (command_if.name == HW_IF_KP)
+        {
+          new_command_interfaces.emplace_back(joint.name, HW_IF_KP, &joint.kp_interface.command_);
+        }
+        else if (command_if.name == HW_IF_KD)
+        {
+          new_command_interfaces.emplace_back(joint.name, HW_IF_KD, &joint.kd_interface.command_);
+        }
       }
     }
   }
@@ -1256,6 +1345,11 @@ std::vector<hardware_interface::CommandInterface> MujocoSystemInterface::export_
 hardware_interface::CallbackReturn MujocoSystemInterface::on_activate(const rclcpp_lifecycle::State& /*previous_state*/)
 {
   RCLCPP_INFO(get_logger(), "Activating MuJoCo hardware interface and starting Simulate threads...");
+
+  if (lockstep_)
+  {
+    sim_->run = true;
+  }
 
   // Start camera and sensor rendering loops
   cameras_->init();
@@ -1278,6 +1372,135 @@ hardware_interface::return_type
 MujocoSystemInterface::perform_command_mode_switch(const std::vector<std::string>& start_interfaces,
                                                    const std::vector<std::string>& stop_interfaces)
 {
+  static const std::array<std::string, 5> hybrid_interfaces = {{
+    hardware_interface::HW_IF_POSITION, hardware_interface::HW_IF_VELOCITY, hardware_interface::HW_IF_EFFORT,
+    HW_IF_KP, HW_IF_KD
+  }};
+
+  auto split_interface = [this](const std::string& interface_name, std::string& joint_name,
+                                std::string& interface_type) -> bool {
+    const size_t delimiter_pos = interface_name.find('/');
+    if (delimiter_pos == std::string::npos)
+    {
+      RCLCPP_ERROR(get_logger(), "Invalid interface name format: %s", interface_name.c_str());
+      return false;
+    }
+    joint_name = interface_name.substr(0, delimiter_pos);
+    interface_type = interface_name.substr(delimiter_pos + 1);
+    return true;
+  };
+
+  auto is_hybrid_joint = [this](const std::string& joint_name) {
+    const auto joint_it = std::find_if(urdf_joint_data_.cbegin(), urdf_joint_data_.cend(),
+                                       [&joint_name](const URDFJointData& joint) { return joint.name == joint_name; });
+    if (joint_it == urdf_joint_data_.cend())
+    {
+      return false;
+    }
+    return std::find(joint_it->command_interfaces.begin(), joint_it->command_interfaces.end(), HW_IF_KP) !=
+               joint_it->command_interfaces.end() &&
+           std::find(joint_it->command_interfaces.begin(), joint_it->command_interfaces.end(), HW_IF_KD) !=
+               joint_it->command_interfaces.end();
+  };
+
+  std::set<std::string> hybrid_joints_to_update;
+  for (const auto& interface_name : start_interfaces)
+  {
+    std::string joint_name;
+    std::string interface_type;
+    if (!split_interface(interface_name, joint_name, interface_type))
+    {
+      return hardware_interface::return_type::ERROR;
+    }
+    if (is_hybrid_joint(joint_name))
+    {
+      hybrid_joints_to_update.insert(joint_name);
+    }
+  }
+  for (const auto& interface_name : stop_interfaces)
+  {
+    std::string joint_name;
+    std::string interface_type;
+    if (!split_interface(interface_name, joint_name, interface_type))
+    {
+      return hardware_interface::return_type::ERROR;
+    }
+    if (is_hybrid_joint(joint_name))
+    {
+      hybrid_joints_to_update.insert(joint_name);
+    }
+  }
+
+  auto selected_types = [&split_interface](const std::vector<std::string>& interfaces, const std::string& joint_name) {
+    std::set<std::string> result;
+    for (const auto& interface_name : interfaces)
+    {
+      std::string selected_joint;
+      std::string interface_type;
+      if (split_interface(interface_name, selected_joint, interface_type) && selected_joint == joint_name)
+      {
+        result.insert(interface_type);
+      }
+    }
+    return result;
+  };
+
+  const auto is_complete_hybrid_set = [](const std::set<std::string>& interfaces) {
+    return interfaces.size() == hybrid_interfaces.size() &&
+           std::all_of(hybrid_interfaces.begin(), hybrid_interfaces.end(),
+                       [&interfaces](const std::string& name) { return interfaces.count(name) == 1; });
+  };
+
+  for (const auto& joint_name : hybrid_joints_to_update)
+  {
+    const auto starting = selected_types(start_interfaces, joint_name);
+    const auto stopping = selected_types(stop_interfaces, joint_name);
+    if ((!starting.empty() && !is_complete_hybrid_set(starting)) ||
+        (!stopping.empty() && !is_complete_hybrid_set(stopping)))
+    {
+      RCLCPP_ERROR(get_logger(),
+                   "Joint '%s' uses hybrid control; position, velocity, effort, kp, and kd must be claimed or "
+                   "released together.",
+                   joint_name.c_str());
+      return hardware_interface::return_type::ERROR;
+    }
+
+    auto joint_it = std::find_if(urdf_joint_data_.begin(), urdf_joint_data_.end(),
+                                 [&joint_name](const URDFJointData& joint) { return joint.name == joint_name; });
+    const auto actuator_name = get_joint_actuator_name(joint_name, get_hardware_info(), mj_model_);
+    auto actuator_it = std::find_if(mujoco_actuator_data_.begin(), mujoco_actuator_data_.end(),
+                                    [&actuator_name](const MuJoCoActuatorData& actuator) {
+                                      return actuator.joint_name == actuator_name;
+                                    });
+    if (joint_it == urdf_joint_data_.end() || actuator_it == mujoco_actuator_data_.end())
+    {
+      RCLCPP_ERROR(get_logger(), "Cannot switch hybrid command mode for joint '%s': actuator not found.",
+                   joint_name.c_str());
+      return hardware_interface::return_type::ERROR;
+    }
+
+    if (!stopping.empty())
+    {
+      joint_it->is_hybrid_control_enabled = false;
+      actuator_it->is_hybrid_control_enabled = false;
+      RCLCPP_INFO(get_logger(), "Joint %s: hybrid control disabled", joint_name.c_str());
+    }
+    if (!starting.empty())
+    {
+      joint_it->is_position_control_enabled = false;
+      joint_it->is_velocity_control_enabled = false;
+      joint_it->is_effort_control_enabled = false;
+      joint_it->is_hybrid_control_enabled = true;
+      actuator_it->is_position_control_enabled = false;
+      actuator_it->is_velocity_control_enabled = false;
+      actuator_it->is_effort_control_enabled = false;
+      actuator_it->is_position_pid_control_enabled = false;
+      actuator_it->is_velocity_pid_control_enabled = false;
+      actuator_it->is_hybrid_control_enabled = true;
+      RCLCPP_INFO(get_logger(), "Joint %s: hybrid q/dq/tau/kp/kd control enabled", joint_name.c_str());
+    }
+  }
+
   auto update_joint_interface = [this](const std::string& interface_name, bool enabled) {
     size_t delimiter_pos = interface_name.find('/');
     if (delimiter_pos == std::string::npos)
@@ -1377,20 +1600,35 @@ MujocoSystemInterface::perform_command_mode_switch(const std::vector<std::string
   // Disable stopped interfaces
   for (const auto& interface : stop_interfaces)
   {
-    update_joint_interface(interface, false);
+    std::string joint_name;
+    std::string interface_type;
+    if (split_interface(interface, joint_name, interface_type) && !is_hybrid_joint(joint_name))
+    {
+      update_joint_interface(interface, false);
+    }
   }
 
   // Enable started interfaces
   for (const auto& interface : start_interfaces)
   {
-    update_joint_interface(interface, true);
+    std::string joint_name;
+    std::string interface_type;
+    if (split_interface(interface, joint_name, interface_type) && !is_hybrid_joint(joint_name))
+    {
+      update_joint_interface(interface, true);
+    }
   }
 
   return hardware_interface::return_type::OK;
 }
 
-hardware_interface::return_type MujocoSystemInterface::read(const rclcpp::Time& time, const rclcpp::Duration& /*period*/)
+hardware_interface::return_type MujocoSystemInterface::read(const rclcpp::Time& time, const rclcpp::Duration& period)
 {
+  // The reset service and asynchronous physics mode can update the control
+  // snapshot concurrently with read(). Locking also makes the source fork
+  // race-free when lockstep is disabled.
+  const std::unique_lock<std::recursive_mutex> lock(*sim_mutex_);
+
   // Joint states
   actuator_state_msg_.header.stamp = time;
   actuator_state_msg_.position.clear();
@@ -1425,13 +1663,20 @@ hardware_interface::return_type MujocoSystemInterface::read(const rclcpp::Time& 
     data.orientation.data.y() = mj_data_control_->sensordata[data.orientation.mj_sensor_index + 2];
     data.orientation.data.z() = mj_data_control_->sensordata[data.orientation.mj_sensor_index + 3];
 
-    data.angular_velocity.data.x() = mj_data_control_->sensordata[data.angular_velocity.mj_sensor_index];
-    data.angular_velocity.data.y() = mj_data_control_->sensordata[data.angular_velocity.mj_sensor_index + 1];
-    data.angular_velocity.data.z() = mj_data_control_->sensordata[data.angular_velocity.mj_sensor_index + 2];
-
-    data.linear_acceleration.data.x() = mj_data_control_->sensordata[data.linear_acceleration.mj_sensor_index];
-    data.linear_acceleration.data.y() = mj_data_control_->sensordata[data.linear_acceleration.mj_sensor_index + 1];
-    data.linear_acceleration.data.z() = mj_data_control_->sensordata[data.linear_acceleration.mj_sensor_index + 2];
+    const Eigen::Vector3d ideal_angular_velocity = {
+      mj_data_control_->sensordata[data.angular_velocity.mj_sensor_index],
+      mj_data_control_->sensordata[data.angular_velocity.mj_sensor_index + 1],
+      mj_data_control_->sensordata[data.angular_velocity.mj_sensor_index + 2]
+    };
+    const Eigen::Vector3d ideal_linear_acceleration = {
+      mj_data_control_->sensordata[data.linear_acceleration.mj_sensor_index],
+      mj_data_control_->sensordata[data.linear_acceleration.mj_sensor_index + 1],
+      mj_data_control_->sensordata[data.linear_acceleration.mj_sensor_index + 2]
+    };
+    const double sensor_period = period.seconds() > 0.0 ? period.seconds() : mj_model_->opt.timestep;
+    data.angular_velocity.data = data.angular_velocity_noise.apply(ideal_angular_velocity, sensor_period);
+    data.linear_acceleration.data =
+        data.linear_acceleration_noise.apply(ideal_linear_acceleration, sensor_period);
   }
 
   // FT Sensor data
@@ -1463,9 +1708,20 @@ hardware_interface::return_type MujocoSystemInterface::read(const rclcpp::Time& 
     floating_base_msg_.pose.pose.orientation.z = mj_data_control_->qpos[free_joint_qpos_adr_ + 6];
 
     // Linear Velocity
-    floating_base_msg_.twist.twist.linear.x = mj_data_control_->qvel[free_joint_qvel_adr_];
-    floating_base_msg_.twist.twist.linear.y = mj_data_control_->qvel[free_joint_qvel_adr_ + 1];
-    floating_base_msg_.twist.twist.linear.z = mj_data_control_->qvel[free_joint_qvel_adr_ + 2];
+    // MuJoCo stores a free joint's translational velocity in world axes while
+    // nav_msgs/Odometry requires twist in child_frame_id. Convert it to the
+    // floating body's local frame so Gazebo and MuJoCo expose the same state.
+    Eigen::Quaterniond world_R_body(
+        mj_data_control_->qpos[free_joint_qpos_adr_ + 3], mj_data_control_->qpos[free_joint_qpos_adr_ + 4],
+        mj_data_control_->qpos[free_joint_qpos_adr_ + 5], mj_data_control_->qpos[free_joint_qpos_adr_ + 6]);
+    world_R_body.normalize();
+    const Eigen::Vector3d body_linear_velocity =
+        world_R_body.conjugate() * Eigen::Vector3d(mj_data_control_->qvel[free_joint_qvel_adr_],
+                                                   mj_data_control_->qvel[free_joint_qvel_adr_ + 1],
+                                                   mj_data_control_->qvel[free_joint_qvel_adr_ + 2]);
+    floating_base_msg_.twist.twist.linear.x = body_linear_velocity.x();
+    floating_base_msg_.twist.twist.linear.y = body_linear_velocity.y();
+    floating_base_msg_.twist.twist.linear.z = body_linear_velocity.z();
 
     // Angular Velocity
     floating_base_msg_.twist.twist.angular.x = mj_data_control_->qvel[free_joint_qvel_adr_ + 3];
@@ -1502,6 +1758,10 @@ hardware_interface::return_type MujocoSystemInterface::write(const rclcpp::Time&
           joint.mimic_multiplier * urdf_joint_data_.at(joint.mimicked_joint_index).velocity_interface.command_;
       joint.effort_interface.command_ =
           joint.mimic_multiplier * urdf_joint_data_.at(joint.mimicked_joint_index).effort_interface.command_;
+      joint.kp_interface.command_ =
+          joint.mimic_multiplier * urdf_joint_data_.at(joint.mimicked_joint_index).kp_interface.command_;
+      joint.kd_interface.command_ =
+          joint.mimic_multiplier * urdf_joint_data_.at(joint.mimicked_joint_index).kd_interface.command_;
     }
   }
 
@@ -1524,7 +1784,24 @@ hardware_interface::return_type MujocoSystemInterface::write(const rclcpp::Time&
     {
       continue;
     }
-    if (actuator.is_position_control_enabled)
+    if (actuator.is_hybrid_control_enabled)
+    {
+      const std::array<double, 7> values = {{
+        actuator.position_interface.command_, actuator.velocity_interface.command_,
+        actuator.effort_interface.command_, actuator.kp_interface.command_, actuator.kd_interface.command_,
+        mj_data_control_->qpos[actuator.mj_pos_adr], mj_data_control_->qvel[actuator.mj_vel_adr]
+      }};
+      if (!std::all_of(values.begin(), values.end(), [](double value) { return std::isfinite(value); }))
+      {
+        RCLCPP_ERROR_THROTTLE(get_logger(), *get_node()->get_clock(), 1000,
+                              "Non-finite hybrid command or state for joint '%s'; refusing to step MuJoCo.",
+                              actuator.joint_name.c_str());
+        return hardware_interface::return_type::ERROR;
+      }
+      mj_data_control_->ctrl[actuator.mj_actuator_id] =
+          compute_hybrid_effort(values[0], values[1], values[2], values[3], values[4], values[5], values[6]);
+    }
+    else if (actuator.is_position_control_enabled)
     {
       mj_data_control_->ctrl[actuator.mj_actuator_id] = actuator.position_interface.command_;
     }
@@ -1546,6 +1823,11 @@ hardware_interface::return_type MujocoSystemInterface::write(const rclcpp::Time&
     {
       mj_data_control_->ctrl[actuator.mj_actuator_id] = actuator.effort_interface.command_;
     }
+  }
+
+  if (lockstep_)
+  {
+    return step_lockstep();
   }
 
   return hardware_interface::return_type::OK;
@@ -1604,6 +1886,8 @@ void MujocoSystemInterface::joint_command_to_actuator_command()
         actuator_interface.position_interface.command_ = joint.position_interface.command_;
         actuator_interface.velocity_interface.command_ = joint.velocity_interface.command_;
         actuator_interface.effort_interface.command_ = joint.effort_interface.command_;
+        actuator_interface.kp_interface.command_ = joint.kp_interface.command_;
+        actuator_interface.kd_interface.command_ = joint.kd_interface.command_;
       }
     });
   }
@@ -1827,6 +2111,8 @@ bool MujocoSystemInterface::register_mujoco_actuators()
         actuator_data.position_interface.command_ = actuator_data.position_interface.state_;
         actuator_data.velocity_interface.command_ = actuator_data.velocity_interface.state_;
         actuator_data.effort_interface.command_ = actuator_data.effort_interface.state_;
+        actuator_data.kp_interface.command_ = 0.0;
+        actuator_data.kd_interface.command_ = 0.0;
       }
     }
   }
@@ -1956,17 +2242,48 @@ void MujocoSystemInterface::register_urdf_joints(const hardware_interface::Hardw
         joint_data.effort_interface.command_ = joint_data.effort_interface.state_;
       }
     }
+    joint_data.kp_interface.command_ = 0.0;
+    joint_data.kd_interface.command_ = 0.0;
 
     // Command interfaces
     // sort the interfaces so that the order is as follows Position, Velocity, Effort, Anything else
     std::vector<std::string> joint_cmd_itfs = {};
     std::transform(joint.command_interfaces.begin(), joint.command_interfaces.end(), std::back_inserter(joint_cmd_itfs),
                    [](const hardware_interface::InterfaceInfo& interface_info) { return interface_info.name; });
-    const auto command_interface_names =
-        get_interfaces_in_order(joint_cmd_itfs, { hardware_interface::HW_IF_POSITION,
-                                                  hardware_interface::HW_IF_VELOCITY, hardware_interface::HW_IF_EFFORT,
-                                                  hardware_interface::HW_IF_TORQUE, hardware_interface::HW_IF_FORCE });
+    const auto command_interface_names = get_interfaces_in_order(
+        joint_cmd_itfs, { hardware_interface::HW_IF_POSITION, hardware_interface::HW_IF_VELOCITY,
+                          hardware_interface::HW_IF_EFFORT, hardware_interface::HW_IF_TORQUE,
+                          hardware_interface::HW_IF_FORCE, HW_IF_KP, HW_IF_KD });
     joint_data.command_interfaces = command_interface_names;
+
+    const auto has_interface = [&command_interface_names](const std::string& name) {
+      return std::find(command_interface_names.begin(), command_interface_names.end(), name) !=
+             command_interface_names.end();
+    };
+    const bool has_hybrid_marker = has_interface(HW_IF_KP) || has_interface(HW_IF_KD);
+    const bool has_complete_hybrid_contract =
+        has_interface(hardware_interface::HW_IF_POSITION) && has_interface(hardware_interface::HW_IF_VELOCITY) &&
+        has_interface(hardware_interface::HW_IF_EFFORT) && has_interface(HW_IF_KP) && has_interface(HW_IF_KD);
+    if (has_hybrid_marker)
+    {
+      if (!has_complete_hybrid_contract)
+      {
+        throw std::runtime_error("Joint '" + joint.name +
+                                 "' must export position, velocity, effort, kp, and kd together for hybrid control");
+      }
+      if (actuator_it->actuator_type != ActuatorType::MOTOR && actuator_it->actuator_type != ActuatorType::CUSTOM)
+      {
+        throw std::runtime_error("Hybrid joint '" + joint.name + "' requires a MuJoCo motor or general actuator");
+      }
+      actuator_it->is_position_control_enabled = false;
+      actuator_it->is_velocity_control_enabled = false;
+      actuator_it->is_effort_control_enabled = false;
+      actuator_it->is_position_pid_control_enabled = false;
+      actuator_it->is_velocity_pid_control_enabled = false;
+      RCLCPP_INFO(get_logger(), "Registered hybrid q/dq/tau/kp/kd command contract for joint '%s'",
+                  joint.name.c_str());
+      continue;
+    }
 
     for (const auto& command_if : command_interface_names)
     {
@@ -2093,6 +2410,21 @@ bool MujocoSystemInterface::register_transmissions(const hardware_interface::Har
 
   for (const auto& t_info : hardware_transmissions)
   {
+    const bool has_hybrid_interface = std::any_of(
+        t_info.joints.begin(), t_info.joints.end(), [](const auto& joint) {
+          return std::find(joint.command_interfaces.begin(), joint.command_interfaces.end(), HW_IF_KP) !=
+                     joint.command_interfaces.end() ||
+                 std::find(joint.command_interfaces.begin(), joint.command_interfaces.end(), HW_IF_KD) !=
+                     joint.command_interfaces.end();
+        });
+    if (has_hybrid_interface)
+    {
+      RCLCPP_FATAL(get_logger(),
+                   "Hybrid kp/kd control is currently supported only for direct joint-to-actuator mappings; "
+                   "transmission '%s' is not supported.",
+                   t_info.name.c_str());
+      return false;
+    }
     if (t_info.joints.empty() || t_info.actuators.empty())
     {
       RCLCPP_FATAL(get_logger(), "Transmission '%s' has no joints or actuators defined", t_info.name.c_str());
@@ -2415,6 +2747,46 @@ void MujocoSystemInterface::register_sensors(const hardware_interface::HardwareI
       sensor_data.angular_velocity.mj_sensor_index = mj_model_->sensor_adr[gyro_id];
       sensor_data.linear_acceleration.mj_sensor_index = mj_model_->sensor_adr[accel_id];
 
+      ImuNoiseConfig angular_velocity_noise;
+      angular_velocity_noise.static_bias =
+          parse_sensor_vector3(sensor, "angular_velocity_static_bias", Eigen::Vector3d::Zero());
+      angular_velocity_noise.white_noise_stddev = parse_sensor_vector3(
+          sensor, "angular_velocity_noise_stddev", Eigen::Vector3d::Zero(), true);
+      angular_velocity_noise.dynamic_bias_stddev = parse_sensor_vector3(
+          sensor, "angular_velocity_dynamic_bias_stddev", Eigen::Vector3d::Zero(), true);
+      angular_velocity_noise.dynamic_bias_correlation_time = parse_sensor_nonnegative_double(
+          sensor, "angular_velocity_dynamic_bias_correlation_time", 0.0);
+
+      ImuNoiseConfig linear_acceleration_noise;
+      linear_acceleration_noise.static_bias =
+          parse_sensor_vector3(sensor, "linear_acceleration_static_bias", Eigen::Vector3d::Zero());
+      linear_acceleration_noise.white_noise_stddev = parse_sensor_vector3(
+          sensor, "linear_acceleration_noise_stddev", Eigen::Vector3d::Zero(), true);
+      linear_acceleration_noise.dynamic_bias_stddev = parse_sensor_vector3(
+          sensor, "linear_acceleration_dynamic_bias_stddev", Eigen::Vector3d::Zero(), true);
+      linear_acceleration_noise.dynamic_bias_correlation_time = parse_sensor_nonnegative_double(
+          sensor, "linear_acceleration_dynamic_bias_correlation_time", 0.0);
+
+      const std::uint64_t noise_seed = parse_sensor_seed(sensor, "noise_seed", 0);
+      sensor_data.angular_velocity_noise.configure(angular_velocity_noise, noise_seed);
+      sensor_data.linear_acceleration_noise.configure(linear_acceleration_noise, noise_seed + 1);
+
+      for (std::size_t axis = 0; axis < 3; ++axis)
+      {
+        sensor_data.angular_velocity_covariance[axis * 3 + axis] =
+            angular_velocity_noise.white_noise_stddev[axis] * angular_velocity_noise.white_noise_stddev[axis];
+        sensor_data.linear_acceleration_covariance[axis * 3 + axis] =
+            linear_acceleration_noise.white_noise_stddev[axis] * linear_acceleration_noise.white_noise_stddev[axis];
+      }
+
+      RCLCPP_INFO_STREAM(
+          get_logger(), "IMU '" << sensor_name << "' noise: gyro bias="
+                                 << angular_velocity_noise.static_bias.transpose() << " stddev="
+                                 << angular_velocity_noise.white_noise_stddev.transpose() << "; accel bias="
+                                 << linear_acceleration_noise.static_bias.transpose() << " stddev="
+                                 << linear_acceleration_noise.white_noise_stddev.transpose() << "; seed="
+                                 << noise_seed);
+
       imu_sensor_data_.push_back(sensor_data);
     }
     else
@@ -2598,6 +2970,8 @@ void MujocoSystemInterface::reset_simulation_state(bool fill_initial_state)
       actuator.position_interface.command_ = actuator.position_interface.state_;
       actuator.velocity_interface.command_ = 0.0;
       actuator.effort_interface.command_ = 0.0;
+      actuator.kp_interface.command_ = 0.0;
+      actuator.kd_interface.command_ = 0.0;
 
       // Also update the ctrl buffer in mj_data_control_ which is used by the physics loop
       if (actuator.is_position_control_enabled && actuator.mj_actuator_id >= 0)
@@ -2616,6 +2990,8 @@ void MujocoSystemInterface::reset_simulation_state(bool fill_initial_state)
     joint.position_interface.command_ = joint.position_interface.state_;
     joint.velocity_interface.command_ = 0.0;
     joint.effort_interface.command_ = 0.0;
+    joint.kp_interface.command_ = 0.0;
+    joint.kd_interface.command_ = 0.0;
   }
 }
 
@@ -2647,6 +3023,37 @@ void MujocoSystemInterface::reset_world_callback(
   response->message = "Successfully reset the MuJoCo world to the " + keyframe_str + " state.";
 
   RCLCPP_INFO(get_logger(), "%s", response->message.c_str());
+}
+
+hardware_interface::return_type MujocoSystemInterface::step_lockstep()
+{
+  const std::unique_lock<std::recursive_mutex> lock(*sim_mutex_);
+
+  // RenderLoop can process the GUI reset action. Preserve clock continuity and
+  // restore the configured initial state just as the asynchronous loop does.
+  if (mj_data_control_->time > 0.1 && mj_data_->time < 0.01)
+  {
+    mj_data_->time = mj_data_control_->time;
+    reset_simulation_state(true);
+  }
+
+  mju_copy(mj_data_->ctrl, mj_data_control_->ctrl, static_cast<int>(mj_model_->nu));
+  mju_copy(mj_data_->qfrc_applied, mj_data_control_->qfrc_applied, static_cast<int>(mj_model_->nv));
+  mj_step(mj_model_, mj_data_);
+
+  const char* message = Diverged(mj_model_->opt.disableflags, mj_data_);
+  if (message)
+  {
+    sim_->run = false;
+    mju::strcpy_arr(sim_->load_error, message);
+    RCLCPP_ERROR(get_logger(), "MuJoCo lockstep simulation diverged: %s", message);
+    return hardware_interface::return_type::ERROR;
+  }
+
+  mj_copyData(mj_data_control_, mj_model_, mj_data_);
+  sim_->AddToHistory();
+  publish_clock();
+  return hardware_interface::return_type::OK;
 }
 
 // simulate in background thread (while rendering in main thread)
@@ -2733,7 +3140,7 @@ void MujocoSystemInterface::PhysicsLoop()
 
             // Copy data to the control
             mju_copy(mj_data_->ctrl, mj_data_control_->ctrl, static_cast<int>(mj_model_->nu));
-            mju_copy(mj_data_->qfrc_applied, mj_data_control_->qfrc_applied, static_cast<int>(mj_model_->nu));
+            mju_copy(mj_data_->qfrc_applied, mj_data_control_->qfrc_applied, static_cast<int>(mj_model_->nv));
             // run single step, let next iteration deal with timing
             mj_step(mj_model_, mj_data_);
 
@@ -2784,7 +3191,7 @@ void MujocoSystemInterface::PhysicsLoop()
 
               // Copy data to the control
               mju_copy(mj_data_->ctrl, mj_data_control_->ctrl, static_cast<int>(mj_model_->nu));
-              mju_copy(mj_data_->qfrc_applied, mj_data_control_->qfrc_applied, static_cast<int>(mj_model_->nu));
+              mju_copy(mj_data_->qfrc_applied, mj_data_control_->qfrc_applied, static_cast<int>(mj_model_->nv));
               // call mj_step
               mj_step(mj_model_, mj_data_);
 
@@ -2845,13 +3252,18 @@ void MujocoSystemInterface::PhysicsLoop()
 
 void MujocoSystemInterface::publish_clock()
 {
-  auto sim_time = mj_data_->time;
-  int32_t sim_time_sec = static_cast<int32_t>(std::floor(sim_time));
-  uint32_t sim_time_nanosec = static_cast<uint32_t>((sim_time - sim_time_sec) * 1e9);
-  rclcpp::Time sim_time_ros(sim_time_sec, sim_time_nanosec, RCL_ROS_TIME);
+  const auto sim_time_nanoseconds = static_cast<int64_t>(std::llround(mj_data_->time * 1e9));
+  rclcpp::Time sim_time_ros(sim_time_nanoseconds, RCL_ROS_TIME);
 
   rosgraph_msgs::msg::Clock sim_time_msg;
   sim_time_msg.clock = sim_time_ros;
+  if (lockstep_)
+  {
+    // Lockstep must not silently discard a physics timestamp because the
+    // realtime publisher's try-lock was temporarily busy.
+    clock_publisher_->publish(sim_time_msg);
+    return;
+  }
 // fixing for different naming convention on humble vs everything else
 #if ROS_DISTRO_HUMBLE
   clock_realtime_publisher_->tryPublish(sim_time_msg);

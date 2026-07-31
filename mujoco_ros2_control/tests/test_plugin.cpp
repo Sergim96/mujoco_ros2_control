@@ -23,6 +23,8 @@
 #include <pluginlib/class_loader.hpp>
 #include <rclcpp/rclcpp.hpp>
 
+#include "mujoco_ros2_control/data.hpp"
+
 class MujocoSystemInterfaceLoadingTest : public ::testing::Test
 {
 protected:
@@ -55,6 +57,48 @@ TEST_F(MujocoSystemInterfaceLoadingTest, test_load_plugin)
   // Construct a sim interface and verify it is not null
   std::shared_ptr<hardware_interface::SystemInterface> mujoco_sim = plugin_loader_->createSharedInstance(class_name);
   EXPECT_NE(mujoco_sim, nullptr);
+}
+
+TEST(MujocoHybridCommandTest, computes_unitree_motor_law)
+{
+  EXPECT_NEAR(mujoco_ros2_control::compute_hybrid_effort(1.2, -0.3, 4.0, 60.0, 2.0, 1.0, -0.1), 15.6, 1e-12);
+}
+
+TEST(MujocoImuNoiseTest, deterministic_seed_has_configured_bias_and_white_noise)
+{
+  mujoco_ros2_control::ImuNoiseConfig config;
+  config.static_bias = Eigen::Vector3d(0.008, -0.006, 0.004);
+  config.white_noise_stddev = Eigen::Vector3d::Constant(0.002);
+
+  mujoco_ros2_control::ImuNoiseModel first;
+  mujoco_ros2_control::ImuNoiseModel second;
+  first.configure(config, 42);
+  second.configure(config, 42);
+  for (int sample = 0; sample < 20; ++sample)
+  {
+    EXPECT_TRUE(first.apply(Eigen::Vector3d::Zero(), 0.001)
+                    .isApprox(second.apply(Eigen::Vector3d::Zero(), 0.001), 0.0));
+  }
+
+  mujoco_ros2_control::ImuNoiseModel statistics;
+  statistics.configure(config, 42);
+  constexpr int sample_count = 100000;
+  Eigen::Vector3d sum = Eigen::Vector3d::Zero();
+  Eigen::Vector3d square_sum = Eigen::Vector3d::Zero();
+  for (int sample = 0; sample < sample_count; ++sample)
+  {
+    const Eigen::Vector3d value = statistics.apply(Eigen::Vector3d::Zero(), 0.001);
+    sum += value;
+    square_sum += value.cwiseProduct(value);
+  }
+  const Eigen::Vector3d mean = sum / sample_count;
+  const Eigen::Vector3d variance = square_sum / sample_count - mean.cwiseProduct(mean);
+  const Eigen::Vector3d stddev = variance.cwiseSqrt();
+  for (Eigen::Index axis = 0; axis < 3; ++axis)
+  {
+    EXPECT_NEAR(mean[axis], config.static_bias[axis], 5e-5);
+    EXPECT_NEAR(stddev[axis], config.white_noise_stddev[axis], 5e-5);
+  }
 }
 
 int main(int argc, char** argv)

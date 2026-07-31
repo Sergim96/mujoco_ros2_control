@@ -2,11 +2,16 @@ cmake_minimum_required(VERSION 3.16)
 
 project(mujoco_ros2_control)
 
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+  set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
 find_package(ros2_control_cmake REQUIRED)
 
 # find dependencies
 find_package(ament_cmake REQUIRED)
 find_package(controller_manager REQUIRED)
+find_package(controller_manager_msgs REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(fmt REQUIRED)
 find_package(glfw3 REQUIRED)
@@ -219,6 +224,7 @@ install(DIRECTORY include/ DESTINATION include)
 add_executable(ros2_control_node src/mujoco_ros2_control_node.cpp)
 target_link_libraries(ros2_control_node PUBLIC
   controller_manager::controller_manager
+  ${controller_manager_msgs_TARGETS}
 )
 install(
   TARGETS ros2_control_node

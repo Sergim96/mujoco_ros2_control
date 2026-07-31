@@ -284,6 +284,9 @@ private:
    */
   void PhysicsLoop();
 
+  /** Execute exactly one MuJoCo integration step from the current command buffer. */
+  hardware_interface::return_type step_lockstep();
+
   /**
    * @brief Publishes the Simulate Application's timestamp to the /clock topic
    *
@@ -327,6 +330,10 @@ private:
   // Speed scaling parameter. if set to >0 then we ignore the value set in the simulate app and instead
   // attempt to loop at whatever this is set to. If this is <0, then we use the value from the app.
   double sim_speed_factor_;
+
+  // In lockstep mode write() owns physics: one successful write is one mj_step.
+  // This avoids using lossy /clock delivery as the controller-manager trigger.
+  bool lockstep_{ false };
 
   // Primary simulate object
   std::unique_ptr<mujoco::Simulate> sim_;

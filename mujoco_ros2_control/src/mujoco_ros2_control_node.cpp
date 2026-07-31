@@ -20,6 +20,7 @@
 
 #include <hardware_interface/version.h>
 #include <controller_manager/controller_manager.hpp>
+#include <controller_manager_msgs/srv/list_hardware_components.hpp>
 #include <rclcpp/executors.hpp>
 #include <realtime_tools/realtime_helpers.hpp>
 
@@ -59,6 +60,7 @@ int main(int argc, char ** argv)
     executor, manager_node_name, "", cm_node_options);
 
   const bool use_sim_time = cm->get_parameter_or("use_sim_time", false);
+  const bool mujoco_lockstep = cm->get_parameter_or("mujoco_lockstep", false);
 
   const bool has_realtime = realtime_tools::has_realtime_kernel();
   const bool lock_memory = cm->get_parameter_or<bool>("lock_memory", has_realtime);
@@ -72,6 +74,7 @@ int main(int argc, char ** argv)
   }
 
   RCLCPP_INFO(cm->get_logger(), "update rate is %d Hz", cm->get_update_rate());
+  RCLCPP_INFO(cm->get_logger(), "MuJoCo lockstep scheduling is %s", mujoco_lockstep ? "enabled" : "disabled");
   const bool manage_overruns = cm->get_parameter_or<bool>("overruns.manage", true);
   RCLCPP_INFO(
     cm->get_logger(), "Overruns handling is : %s", manage_overruns ? "enabled" : "disabled");
@@ -81,7 +84,7 @@ int main(int argc, char ** argv)
     thread_priority);
 
   std::thread cm_thread(
-    [cm, thread_priority, use_sim_time, manage_overruns]()
+    [cm, thread_priority, use_sim_time, manage_overruns, mujoco_lockstep]()
     {
       // portable function that gets now from the cm on humble or later appropriately
       auto get_cm_now = [](const auto& ctrl_mgr) -> rclcpp::Time {
@@ -130,6 +133,59 @@ int main(int argc, char ** argv)
         RCLCPP_INFO(
           cm->get_logger(), "Successful set up FIFO RT scheduling policy with priority %i.",
           thread_priority);
+      }
+
+      // In lockstep mode the hardware write() call advances MuJoCo exactly
+      // once. Pace that loop from a steady wall clock and pass an exact period
+      // to every controller update; /clock remains an output of the step, not
+      // a lossy trigger for the next one.
+      if (mujoco_lockstep)
+      {
+        // An empty ResourceManager reports itself initialized. Controller
+        // manager creates its hardware-list service only after the MuJoCo
+        // component has initialized and activated, making it a reliable
+        // readiness barrier for the first update cycle.
+        auto readiness_client = cm->create_client<controller_manager_msgs::srv::ListHardwareComponents>(
+          "/controller_manager/list_hardware_components");
+        while (rclcpp::ok() && !readiness_client->wait_for_service(100ms))
+        {
+        }
+
+        const auto period = std::chrono::nanoseconds(1'000'000'000 / cm->get_update_rate());
+        const auto control_period = rclcpp::Duration::from_nanoseconds(period.count());
+        rclcpp::Time control_time = get_cm_now(cm);
+        if (control_time.nanoseconds() == 0)
+        {
+          // ControllerManager rejects a zero update timestamp even after the
+          // initial t=0 clock has activated ROS time.
+          control_time = control_time + control_period;
+        }
+        auto next_iteration_time = std::chrono::steady_clock::now();
+
+        while (rclcpp::ok())
+        {
+          cm->read(control_time, control_period);
+          cm->update(control_time, control_period);
+          cm->write(control_time, control_period);
+          control_time = control_time + control_period;
+
+          next_iteration_time += period;
+          const auto time_now = std::chrono::steady_clock::now();
+          if (manage_overruns && next_iteration_time < time_now)
+          {
+            const double overrun_ms =
+              static_cast<double>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(time_now - next_iteration_time).count()) /
+              1.e6;
+            RCLCPP_WARN_THROTTLE(
+              cm->get_logger(), *cm->get_clock(), 1000,
+              "MuJoCo lockstep loop missed its deadline by %.3f ms. No physics steps are skipped; "
+              "real-time factor may temporarily fall below one.",
+              overrun_ms);
+          }
+          std::this_thread::sleep_until(next_iteration_time);
+        }
+        return;
       }
 
       // CHANGED FROM UPSTREAM

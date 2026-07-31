@@ -1,0 +1,1 @@
+Upstream launch tests depend on the ignored demo package; core and B1 integration tests remain enabled.

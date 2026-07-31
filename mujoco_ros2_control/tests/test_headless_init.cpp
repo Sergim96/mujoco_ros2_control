@@ -16,6 +16,7 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -95,7 +96,17 @@ protected:
       <geom name="box2_geom" type="box" size="0.05 0.05 0.05"
             contype="1" conaffinity="1" friction="0.6"/>
     </body>
+
+    <body name="link1" pos="0 0 0.5">
+      <joint name="joint1" type="hinge" axis="0 1 0"/>
+      <inertial pos="0 0 0" mass="1.0" diaginertia="0.01 0.01 0.01"/>
+      <geom name="link1_geom" type="box" size="0.05 0.05 0.05"/>
+    </body>
   </worldbody>
+
+  <actuator>
+    <motor name="joint1" joint="joint1"/>
+  </actuator>
 </mujoco>
 )";
     file.close();
@@ -110,6 +121,24 @@ protected:
     info.hardware_parameters["meshdir"] = "";
     info.hardware_parameters["headless"] = "true";           // Enable headless mode for CI compatibility
     info.hardware_parameters["disable_rendering"] = "true";  // Disable cameras/lidar to avoid OpenGL issues in tests
+    info.hardware_parameters["lockstep"] = "true";
+
+    hardware_interface::ComponentInfo joint;
+    joint.name = "joint1";
+    joint.type = "joint";
+    auto make_interface = [](const std::string& name, const std::string& initial_value = "") {
+      hardware_interface::InterfaceInfo interface;
+      interface.name = name;
+      interface.initial_value = initial_value;
+      interface.size = 1;
+      interface.enable_limits = false;
+      return interface;
+    };
+    joint.command_interfaces = { make_interface("position"), make_interface("velocity"), make_interface("effort"),
+                                 make_interface("kp"), make_interface("kd") };
+    joint.state_interfaces = { make_interface("position", "0.0"), make_interface("velocity", "0.0"),
+                               make_interface("effort", "0.0") };
+    info.joints.push_back(joint);
 
     return info;
   }
@@ -152,6 +181,47 @@ TEST_F(HeadlessInitTest, HeadlessInitialization)
   // Test that we can export state interfaces without crashing
   auto state_interfaces = interface_->export_state_interfaces();
   EXPECT_GE(state_interfaces.size(), 0);
+}
+
+TEST_F(HeadlessInitTest, HybridWriteAdvancesExactlyOneStep)
+{
+#if ROS_DISTRO_HUMBLE
+  ASSERT_EQ(interface_->on_init(hardware_info_), hardware_interface::CallbackReturn::SUCCESS);
+#else
+  hardware_interface::HardwareComponentInterfaceParams params;
+  params.hardware_info = hardware_info_;
+  ASSERT_EQ(interface_->on_init(params), hardware_interface::CallbackReturn::SUCCESS);
+#endif
+
+  auto commands = interface_->export_command_interfaces();
+  ASSERT_EQ(commands.size(), 5u);
+  const std::vector<std::string> expected_names = { "joint1/position", "joint1/velocity", "joint1/effort",
+                                                    "joint1/kp", "joint1/kd" };
+  std::vector<std::string> actual_names;
+  for (auto& command : commands)
+  {
+    actual_names.push_back(command.get_name());
+  }
+  EXPECT_EQ(actual_names, expected_names);
+  EXPECT_EQ(interface_->perform_command_mode_switch({ "joint1/effort" }, {}),
+            hardware_interface::return_type::ERROR);
+  ASSERT_EQ(interface_->perform_command_mode_switch(expected_names, {}), hardware_interface::return_type::OK);
+
+  const std::array<double, 5> values = {{ 0.1, 0.0, 0.0, 10.0, 1.0 }};
+  for (std::size_t index = 0; index < commands.size(); ++index)
+  {
+    ASSERT_TRUE(commands[index].set_value(values[index]));
+  }
+
+  const auto period = rclcpp::Duration::from_seconds(0.002);
+  ASSERT_EQ(interface_->write(rclcpp::Time(1, 0, RCL_ROS_TIME), period), hardware_interface::return_type::OK);
+
+  mjData* data = nullptr;
+  interface_->get_data(data);
+  ASSERT_NE(data, nullptr);
+  EXPECT_NEAR(data->time, 0.002, 1e-12);
+  EXPECT_NEAR(data->ctrl[0], 1.0, 1e-12);
+  mj_deleteData(data);
 }
 
 int main(int argc, char** argv)

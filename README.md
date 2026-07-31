@@ -1,5 +1,43 @@
 # MuJoCo ros2_control
 
+> This workspace tracks upstream tag `0.0.2` on branch
+> `unitree-lockstep-hybrid` and adds the Unitree B1 integration described
+> below.
+
+## Workspace fork extensions
+
+The fork adds an optional `lockstep` hardware parameter and a matching
+`controller_manager.mujoco_lockstep` node parameter. When both are enabled,
+the controller manager is paced by a steady wall clock and every successful
+hardware `write()` executes exactly one `mj_step`. Physics steps are never
+skipped to recover from a late deadline, so simulation time remains a strict
+multiple of the MJCF timestep.
+
+Joints may also export the five-interface Unitree hybrid command contract:
+`position`, `velocity`, `effort`, `kp`, and `kd`. All five must be claimed and
+released together. For MuJoCo motor/general actuators, the applied control is:
+
+```text
+effort + kp * (desired_position - position)
+       + kd * (desired_velocity - velocity)
+```
+
+Hybrid interfaces currently require a direct joint-to-actuator mapping;
+hybrid joints using URDF transmissions are rejected during initialization.
+
+IMU sensor declarations may additionally provide deterministic static bias,
+per-axis white-noise standard deviation, and first-order correlated dynamic
+bias parameters for angular velocity and linear acceleration. The fork applies
+these errors in the hardware `read()` path because MuJoCo's MJCF sensor `noise`
+attribute is metadata and does not perturb sensor output. `noise_seed` makes a
+run repeatable. All parameters default to zero, so upstream models retain their
+original ideal-sensor behavior.
+
+The upstream demo and launch-test packages are marked `COLCON_IGNORE` in this
+workspace because their Lyrical `position_controllers` dependency is not
+available for Ubuntu Resolute. The core package, messages, plugins, and their
+C++/Python unit tests remain discoverable.
+
 [![Rdev](https://build.ros2.org/job/Rdev__mujoco_ros2_control__ubuntu_noble_amd64/badge/icon)](https://build.ros2.org/job/Rdev__mujoco_ros2_control__ubuntu_noble_amd64/) [![Kdev](https://build.ros2.org/job/Kdev__mujoco_ros2_control__ubuntu_noble_amd64/badge/icon)](https://build.ros2.org/job/Kdev__mujoco_ros2_control__ubuntu_noble_amd64/) [![Jdev](https://build.ros2.org/job/Jdev__mujoco_ros2_control__ubuntu_noble_amd64/badge/icon)](https://build.ros2.org/job/Jdev__mujoco_ros2_control__ubuntu_noble_amd64/) [![Hdev](https://build.ros2.org/job/Hdev__mujoco_ros2_control__ubuntu_jammy_amd64/badge/icon)](https://build.ros2.org/job/Hdev__mujoco_ros2_control__ubuntu_jammy_amd64/) [![CI](https://github.com/ros-controls/mujoco_ros2_control/actions/workflows/ci.yaml/badge.svg)](https://github.com/ros-controls/mujoco_ros2_control/actions/workflows/ci.yaml) ![License](https://img.shields.io/github/license/ros-controls/mujoco_ros2_control) [![Codecov](https://codecov.io/gh/ros-controls/mujoco_ros2_control/branch/main/graph/badge.svg)](https://codecov.io/gh/ros-controls/mujoco_ros2_control)
 
 This repository provides a ros2_control system interface and supporting packages to run ROS 2 controllers against the MuJoCo physics simulator.

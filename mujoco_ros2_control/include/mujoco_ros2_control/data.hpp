@@ -24,11 +24,90 @@
 #include <hardware_interface/types/hardware_interface_type_values.hpp>
 #include "control_toolbox/pid_ros.hpp"
 
+#include <cmath>
+#include <cstdint>
+#include <random>
 #include <string>
 #include <vector>
 
 namespace mujoco_ros2_control
 {
+
+inline constexpr char HW_IF_KP[] = "kp";
+inline constexpr char HW_IF_KD[] = "kd";
+
+inline double compute_hybrid_effort(double desired_position, double desired_velocity, double feedforward_effort,
+                                    double kp, double kd, double measured_position, double measured_velocity)
+{
+  return feedforward_effort + kp * (desired_position - measured_position) +
+         kd * (desired_velocity - measured_velocity);
+}
+
+struct ImuNoiseConfig
+{
+  Eigen::Vector3d static_bias{ Eigen::Vector3d::Zero() };
+  Eigen::Vector3d white_noise_stddev{ Eigen::Vector3d::Zero() };
+  Eigen::Vector3d dynamic_bias_stddev{ Eigen::Vector3d::Zero() };
+  double dynamic_bias_correlation_time{ 0.0 };
+};
+
+/**
+ * Deterministic IMU error model matching SDFormat's Gaussian sensor model.
+ *
+ * White noise is independent per sample. Dynamic bias is a first-order
+ * Gauss-Markov process driven by dynamic_bias_stddev; a non-positive
+ * correlation time falls back to a random walk. The fixed seed makes tests
+ * and simulator comparisons repeatable.
+ */
+class ImuNoiseModel
+{
+public:
+  void configure(const ImuNoiseConfig& config, const std::uint64_t seed)
+  {
+    config_ = config;
+    generator_.seed(seed);
+    normal_.reset();
+    dynamic_bias_.setZero();
+  }
+
+  Eigen::Vector3d apply(const Eigen::Vector3d& ideal, const double dt)
+  {
+    Eigen::Vector3d result = ideal + config_.static_bias;
+    const double safe_dt = std::isfinite(dt) && dt > 0.0 ? dt : 0.0;
+    const double tau = config_.dynamic_bias_correlation_time;
+    const double decay = safe_dt > 0.0 && tau > 0.0 ? std::exp(-safe_dt / tau) : 1.0;
+
+    for (Eigen::Index axis = 0; axis < 3; ++axis)
+    {
+      const double dynamic_stddev = config_.dynamic_bias_stddev[axis];
+      if (safe_dt > 0.0 && dynamic_stddev > 0.0)
+      {
+        double innovation_stddev = dynamic_stddev * std::sqrt(safe_dt);
+        if (tau > 0.0)
+        {
+          // Exact discretization of db = -b/tau dt + sigma dW.
+          innovation_stddev =
+              dynamic_stddev * std::sqrt(0.5 * tau * (1.0 - decay * decay));
+          dynamic_bias_[axis] *= decay;
+        }
+        dynamic_bias_[axis] += innovation_stddev * normal_(generator_);
+      }
+      result[axis] += dynamic_bias_[axis] + config_.white_noise_stddev[axis] * normal_(generator_);
+    }
+    return result;
+  }
+
+  const Eigen::Vector3d& dynamic_bias() const
+  {
+    return dynamic_bias_;
+  }
+
+private:
+  ImuNoiseConfig config_;
+  Eigen::Vector3d dynamic_bias_{ Eigen::Vector3d::Zero() };
+  std::mt19937_64 generator_{ 0 };
+  std::normal_distribution<double> normal_{ 0.0, 1.0 };
+};
 
 /**
  * Maps to MuJoCo actuator types:
@@ -95,6 +174,8 @@ struct MuJoCoActuatorData
   InterfaceData position_interface{ hardware_interface::HW_IF_POSITION };
   InterfaceData velocity_interface{ hardware_interface::HW_IF_VELOCITY };
   InterfaceData effort_interface{ hardware_interface::HW_IF_EFFORT };
+  InterfaceData kp_interface{ HW_IF_KP };
+  InterfaceData kd_interface{ HW_IF_KD };
   std::shared_ptr<control_toolbox::PidROS> pos_pid{ nullptr };
   std::shared_ptr<control_toolbox::PidROS> vel_pid{ nullptr };
   ActuatorType actuator_type{ ActuatorType::UNKNOWN };
@@ -110,6 +191,7 @@ struct MuJoCoActuatorData
   bool is_velocity_pid_control_enabled{ false };
   bool is_velocity_control_enabled{ false };
   bool is_effort_control_enabled{ false };
+  bool is_hybrid_control_enabled{ false };
   bool has_pos_pid{ false };
   bool has_vel_pid{ false };
 
@@ -155,6 +237,8 @@ struct URDFJointData
   InterfaceData position_interface{ hardware_interface::HW_IF_POSITION };
   InterfaceData velocity_interface{ hardware_interface::HW_IF_VELOCITY };
   InterfaceData effort_interface{ hardware_interface::HW_IF_EFFORT };
+  InterfaceData kp_interface{ HW_IF_KP };
+  InterfaceData kd_interface{ HW_IF_KD };
 
   std::vector<std::string> command_interfaces = {};
 
@@ -165,6 +249,7 @@ struct URDFJointData
   bool is_position_control_enabled{ false };
   bool is_velocity_control_enabled{ false };
   bool is_effort_control_enabled{ false };
+  bool is_hybrid_control_enabled{ false };
 
   void copy_state_from_transmission()
   {
@@ -209,6 +294,8 @@ struct IMUSensorData
   SensorData<Eigen::Quaternion<double>> orientation;
   SensorData<Eigen::Vector3d> angular_velocity;
   SensorData<Eigen::Vector3d> linear_acceleration;
+  ImuNoiseModel angular_velocity_noise;
+  ImuNoiseModel linear_acceleration_noise;
 
   // These are currently unused but added to support controllers that require them.
   std::vector<double> orientation_covariance;
