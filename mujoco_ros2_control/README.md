@@ -199,6 +199,30 @@ Could map to the following hardware interface:
 > [!NOTE]
 > The `torque` and `force` command/state interfaces are semantically equivalent to `effort`, and map to the same underlying data in the sim.
 
+#### Optional plant joint friction
+
+A one-DoF hinge or slide joint can define physical friction directly in its
+`ros2_control` joint data. All seven parameters are required when the model is
+enabled:
+
+```xml
+  <joint name="joint1">
+    <param name="mujoco_friction_g0">-0.66225</param>
+    <param name="mujoco_friction_g1">6.72831</param>
+    <param name="mujoco_friction_g2">24.99379</param>
+    <param name="mujoco_friction_g3">1.42598</param>
+    <param name="mujoco_friction_g4">15.09085</param>
+    <param name="mujoco_friction_g5">0.05963</param>
+    <param name="mujoco_friction_scale">1.0</param>
+  </joint>
+```
+
+The simulator applies
+`scale * (g0*tanh(g1*v) - g0*tanh(g2*v) + g3*tanh(g4*v) + g5*v)` as an
+opposing generalized force exactly once per physics step. This works for both
+actuated and passive joints. A zero scale or six zero coefficients disables the
+model for that joint.
+
 ### Grippers and Mimic Joints
 
 Many robot grippers include mimic joints, where control of a single actuator affects the state of many joints.

@@ -24,6 +24,7 @@
 
 #include <hardware_interface/version.h>
 #include <hardware_interface/hardware_info.hpp>
+#include <mujoco_ros2_control/joint_friction.hpp>
 #include <mujoco_ros2_control/mujoco_system_interface.hpp>
 #include <rclcpp/rclcpp.hpp>
 
@@ -148,6 +149,21 @@ protected:
   std::shared_ptr<mujoco_ros2_control::MujocoSystemInterface> interface_;
 };
 
+TEST(JointFrictionTest, ImplementsSixCoefficientOddLaw)
+{
+  mujoco_ros2_control::JointFrictionParameters friction;
+  friction.coefficients = {{ -0.66225, 6.72831, 24.99379, 1.42598, 15.09085, 0.05963 }};
+  friction.scale = 0.75;
+
+  EXPECT_DOUBLE_EQ(friction.effort(0.0), 0.0);
+  EXPECT_NEAR(friction.effort(-0.4), -friction.effort(0.4), 1e-14);
+  EXPECT_NEAR(friction.effort(0.4),
+              0.75 * (-0.66225 * std::tanh(6.72831 * 0.4) +
+                      0.66225 * std::tanh(24.99379 * 0.4) +
+                      1.42598 * std::tanh(15.09085 * 0.4) + 0.05963 * 0.4),
+              1e-14);
+}
+
 TEST_F(HeadlessInitTest, HeadlessInitialization)
 {
   // Test that MujocoSystemInterface can be initialized in headless mode
@@ -222,6 +238,64 @@ TEST_F(HeadlessInitTest, HybridWriteAdvancesExactlyOneStep)
   EXPECT_NEAR(data->time, 0.002, 1e-12);
   EXPECT_NEAR(data->ctrl[0], 1.0, 1e-12);
   mj_deleteData(data);
+}
+
+TEST_F(HeadlessInitTest, PlantFrictionOpposesMotionWithoutAccumulatingAppliedEffort)
+{
+  auto& parameters = hardware_info_.joints[0].parameters;
+  parameters["mujoco_friction_g0"] = "0.0";
+  parameters["mujoco_friction_g1"] = "0.0";
+  parameters["mujoco_friction_g2"] = "0.0";
+  parameters["mujoco_friction_g3"] = "0.0";
+  parameters["mujoco_friction_g4"] = "0.0";
+  parameters["mujoco_friction_g5"] = "1.0";
+  parameters["mujoco_friction_scale"] = "1.0";
+
+#if ROS_DISTRO_HUMBLE
+  ASSERT_EQ(interface_->on_init(hardware_info_), hardware_interface::CallbackReturn::SUCCESS);
+#else
+  hardware_interface::HardwareComponentInterfaceParams params;
+  params.hardware_info = hardware_info_;
+  ASSERT_EQ(interface_->on_init(params), hardware_interface::CallbackReturn::SUCCESS);
+#endif
+
+  auto commands = interface_->export_command_interfaces();
+  const std::vector<std::string> command_names = { "joint1/position", "joint1/velocity", "joint1/effort",
+                                                   "joint1/kp", "joint1/kd" };
+  ASSERT_EQ(commands.size(), command_names.size());
+  ASSERT_EQ(interface_->perform_command_mode_switch(command_names, {}), hardware_interface::return_type::OK);
+  for (auto& command : commands)
+  {
+    ASSERT_TRUE(command.set_value(0.0));
+  }
+
+  mjModel* model = nullptr;
+  mjData* data = nullptr;
+  interface_->get_model(model);
+  interface_->get_data(data);
+  ASSERT_NE(model, nullptr);
+  ASSERT_NE(data, nullptr);
+  const int joint_id = mj_name2id(model, mjOBJ_JOINT, "joint1");
+  ASSERT_GE(joint_id, 0);
+  const int dof_address = model->jnt_dofadr[joint_id];
+  data->qvel[dof_address] = 1.0;
+  mj_forward(model, data);
+  interface_->set_data(data);
+
+  const auto period = rclcpp::Duration::from_seconds(0.002);
+  ASSERT_EQ(interface_->write(rclcpp::Time(1, 0, RCL_ROS_TIME), period), hardware_interface::return_type::OK);
+  interface_->get_data(data);
+  EXPECT_NEAR(data->qvel[dof_address], 0.8, 1e-12);
+  EXPECT_DOUBLE_EQ(data->qfrc_applied[dof_address], 0.0);
+
+  ASSERT_EQ(interface_->write(rclcpp::Time(1, 2000000, RCL_ROS_TIME), period),
+            hardware_interface::return_type::OK);
+  interface_->get_data(data);
+  EXPECT_NEAR(data->qvel[dof_address], 0.64, 1e-12);
+  EXPECT_DOUBLE_EQ(data->qfrc_applied[dof_address], 0.0);
+
+  mj_deleteData(data);
+  mj_deleteModel(model);
 }
 
 int main(int argc, char** argv)

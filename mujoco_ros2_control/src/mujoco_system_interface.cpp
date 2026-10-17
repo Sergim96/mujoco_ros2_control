@@ -24,6 +24,7 @@
 #include <fmt/ranges.h>
 
 #include <unistd.h>
+#include <algorithm>
 #include <array>
 #include <cerrno>
 #include <chrono>
@@ -1042,6 +1043,11 @@ MujocoSystemInterface::on_init(const hardware_interface::HardwareComponentInterf
   // Pull joint and sensor information
   RCLCPP_INFO(get_logger(), "Registering joints and sensors.");
   register_urdf_joints(get_hardware_info());
+  if (!register_joint_friction(get_hardware_info()))
+  {
+    RCLCPP_FATAL(get_logger(), "Failed to register MuJoCo joint friction, exiting...");
+    return hardware_interface::CallbackReturn::FAILURE;
+  }
   register_sensors(get_hardware_info());
   if (!register_transmissions(get_hardware_info()))
   {
@@ -2401,6 +2407,136 @@ void MujocoSystemInterface::register_urdf_joints(const hardware_interface::Hardw
   }
 }
 
+bool MujocoSystemInterface::register_joint_friction(const hardware_interface::HardwareInfo& hardware_info)
+{
+  constexpr std::array<const char*, 7> parameter_names = {{
+    "mujoco_friction_g0", "mujoco_friction_g1", "mujoco_friction_g2", "mujoco_friction_g3",
+    "mujoco_friction_g4", "mujoco_friction_g5", "mujoco_friction_scale"
+  }};
+
+  mujoco_joint_friction_data_.clear();
+  for (const auto& joint : hardware_info.joints)
+  {
+    const bool has_any_parameter =
+        std::any_of(parameter_names.begin(), parameter_names.end(), [&joint](const char* name) {
+          return joint.parameters.find(name) != joint.parameters.end();
+        });
+    if (!has_any_parameter)
+    {
+      continue;
+    }
+
+    JointFrictionParameters parameters;
+    for (std::size_t index = 0; index < parameter_names.size(); ++index)
+    {
+      const std::string name(parameter_names[index]);
+      const auto parameter = joint.parameters.find(name);
+      if (parameter == joint.parameters.end())
+      {
+        RCLCPP_ERROR(get_logger(), "Joint '%s' defines MuJoCo friction but is missing parameter '%s'",
+                     joint.name.c_str(), name.c_str());
+        return false;
+      }
+
+      try
+      {
+        std::size_t consumed = 0;
+        const double value = std::stod(parameter->second, &consumed);
+        if (consumed != parameter->second.size() || !std::isfinite(value))
+        {
+          throw std::invalid_argument("not one finite number");
+        }
+        if (index < parameters.coefficients.size())
+        {
+          parameters.coefficients[index] = value;
+        }
+        else
+        {
+          parameters.scale = value;
+        }
+      }
+      catch (const std::exception&)
+      {
+        RCLCPP_ERROR(get_logger(), "Joint '%s' parameter '%s' must be one finite number, got '%s'",
+                     joint.name.c_str(), name.c_str(), parameter->second.c_str());
+        return false;
+      }
+    }
+
+    if (parameters.scale < 0.0)
+    {
+      RCLCPP_ERROR(get_logger(), "Joint '%s' parameter 'mujoco_friction_scale' must be non-negative",
+                   joint.name.c_str());
+      return false;
+    }
+    const bool all_zero = std::all_of(parameters.coefficients.begin(), parameters.coefficients.end(),
+                                      [](const double value) { return value == 0.0; });
+    if (!all_zero && parameters.coefficients[5] <= 0.0)
+    {
+      RCLCPP_ERROR(get_logger(), "Nonzero friction for joint '%s' requires mujoco_friction_g5 > 0",
+                   joint.name.c_str());
+      return false;
+    }
+    if (all_zero || parameters.scale == 0.0)
+    {
+      continue;
+    }
+
+    const int joint_id = mj_name2id(mj_model_, mjOBJ_JOINT, joint.name.c_str());
+    if (joint_id < 0)
+    {
+      RCLCPP_ERROR(get_logger(), "Friction joint '%s' does not exist in the MuJoCo model", joint.name.c_str());
+      return false;
+    }
+    if (mj_model_->jnt_type[joint_id] != mjJNT_HINGE && mj_model_->jnt_type[joint_id] != mjJNT_SLIDE)
+    {
+      RCLCPP_ERROR(get_logger(), "Friction joint '%s' must be a one-DoF hinge or slide joint", joint.name.c_str());
+      return false;
+    }
+
+    mujoco_joint_friction_data_.push_back(
+        MuJoCoJointFrictionData{ joint.name, mj_model_->jnt_dofadr[joint_id], parameters, 0.0 });
+  }
+
+  RCLCPP_INFO(get_logger(), "Registered plant friction for %zu MuJoCo joints",
+              mujoco_joint_friction_data_.size());
+  return true;
+}
+
+void MujocoSystemInterface::restore_joint_friction()
+{
+  for (auto& friction : mujoco_joint_friction_data_)
+  {
+    mj_data_->qfrc_applied[friction.mj_dof_adr] -= friction.applied_effort;
+    friction.applied_effort = 0.0;
+  }
+}
+
+bool MujocoSystemInterface::step_physics_with_friction()
+{
+  for (auto& friction : mujoco_joint_friction_data_)
+  {
+    const double velocity = mj_data_->qvel[friction.mj_dof_adr];
+    const double friction_effort = friction.parameters.effort(velocity);
+    if (!std::isfinite(velocity) || !std::isfinite(friction_effort))
+    {
+      RCLCPP_ERROR(get_logger(), "Cannot apply friction to joint '%s': velocity or effort is non-finite",
+                   friction.joint_name.c_str());
+      restore_joint_friction();
+      return false;
+    }
+
+    // The model returns signed friction effort in the direction of velocity.
+    // MuJoCo receives its negative as a generalized force for this step only.
+    friction.applied_effort = -friction_effort;
+    mj_data_->qfrc_applied[friction.mj_dof_adr] += friction.applied_effort;
+  }
+
+  mj_step(mj_model_, mj_data_);
+  restore_joint_friction();
+  return true;
+}
+
 bool MujocoSystemInterface::register_transmissions(const hardware_interface::HardwareInfo& hardware_info)
 {
   transmission_instances_.clear();
@@ -3039,7 +3175,12 @@ hardware_interface::return_type MujocoSystemInterface::step_lockstep()
 
   mju_copy(mj_data_->ctrl, mj_data_control_->ctrl, static_cast<int>(mj_model_->nu));
   mju_copy(mj_data_->qfrc_applied, mj_data_control_->qfrc_applied, static_cast<int>(mj_model_->nv));
-  mj_step(mj_model_, mj_data_);
+  if (!step_physics_with_friction())
+  {
+    sim_->run = false;
+    mju::strcpy_arr(sim_->load_error, "MuJoCo plant friction produced a non-finite value");
+    return hardware_interface::return_type::ERROR;
+  }
 
   const char* message = Diverged(mj_model_->opt.disableflags, mj_data_);
   if (message)
@@ -3142,7 +3283,12 @@ void MujocoSystemInterface::PhysicsLoop()
             mju_copy(mj_data_->ctrl, mj_data_control_->ctrl, static_cast<int>(mj_model_->nu));
             mju_copy(mj_data_->qfrc_applied, mj_data_control_->qfrc_applied, static_cast<int>(mj_model_->nv));
             // run single step, let next iteration deal with timing
-            mj_step(mj_model_, mj_data_);
+            if (!step_physics_with_friction())
+            {
+              sim_->run = false;
+              mju::strcpy_arr(sim_->load_error, "MuJoCo plant friction produced a non-finite value");
+              continue;
+            }
 
             // Publish clock after each successful step
             publish_clock();
@@ -3193,7 +3339,12 @@ void MujocoSystemInterface::PhysicsLoop()
               mju_copy(mj_data_->ctrl, mj_data_control_->ctrl, static_cast<int>(mj_model_->nu));
               mju_copy(mj_data_->qfrc_applied, mj_data_control_->qfrc_applied, static_cast<int>(mj_model_->nv));
               // call mj_step
-              mj_step(mj_model_, mj_data_);
+              if (!step_physics_with_friction())
+              {
+                sim_->run = false;
+                mju::strcpy_arr(sim_->load_error, "MuJoCo plant friction produced a non-finite value");
+                break;
+              }
 
               // Publish clock after each successful step
               publish_clock();

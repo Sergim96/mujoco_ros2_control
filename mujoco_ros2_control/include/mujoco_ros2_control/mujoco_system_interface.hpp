@@ -47,6 +47,7 @@
 #include "simulate.h"      // must be on your include path, handled by CMake
 
 #include "mujoco_ros2_control/data.hpp"
+#include "mujoco_ros2_control/joint_friction.hpp"
 #include "mujoco_ros2_control/mujoco_cameras.hpp"
 #include "mujoco_ros2_control/mujoco_lidar.hpp"
 
@@ -171,6 +172,15 @@ private:
    * the HW interface.
    */
   void register_urdf_joints(const hardware_interface::HardwareInfo& info);
+
+  /** Register optional six-coefficient plant friction from per-joint parameters. */
+  bool register_joint_friction(const hardware_interface::HardwareInfo& info);
+
+  /** Apply plant friction to qfrc_applied for the duration of one physics step. */
+  bool step_physics_with_friction();
+
+  /** Remove the temporary plant-friction contribution from qfrc_applied. */
+  void restore_joint_friction();
 
   /**
    * @brief Loads transmission information into the HW interface.
@@ -386,6 +396,9 @@ private:
 
   // Data containers for the MuJoCo Actuators
   std::vector<MuJoCoActuatorData> mujoco_actuator_data_;
+
+  // Optional physical joint-friction models, including passive joints.
+  std::vector<MuJoCoJointFrictionData> mujoco_joint_friction_data_;
 
   // Data containers for the URDF joints
   std::vector<URDFJointData> urdf_joint_data_;

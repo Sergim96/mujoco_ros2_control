@@ -13,8 +13,10 @@
 // limitations under the License.
 
 #include <errno.h>
+#include <atomic>
 #include <chrono>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 
@@ -23,6 +25,8 @@
 #include <controller_manager_msgs/srv/list_hardware_components.hpp>
 #include <rclcpp/executors.hpp>
 #include <realtime_tools/realtime_helpers.hpp>
+
+#include "mujoco_ros2_control/lockstep_timing.hpp"
 
 using namespace std::chrono_literals;
 
@@ -38,6 +42,25 @@ int const kSchedPriority = 50;
 int main(int argc, char ** argv)
 {
   rclcpp::init(argc, argv);
+  std::atomic<bool> stop_control_loop{false};
+  std::atomic<bool> join_before_shutdown{false};
+  std::thread cm_thread;
+  std::mutex control_thread_mutex;
+  const auto context = rclcpp::contexts::get_global_default_context();
+  const auto join_control_thread = [&]() {
+    std::lock_guard<std::mutex> lock(control_thread_mutex);
+    if (cm_thread.joinable() && cm_thread.get_id() != std::this_thread::get_id())
+      cm_thread.join();
+  };
+  // Register before ControllerManager's teardown callbacks. The manager can
+  // otherwise release loaned controller interfaces while update() still uses
+  // them. Wall-clock/lockstep loops finish with their ROS context still valid.
+  const auto pre_shutdown = context->add_pre_shutdown_callback([&]() {
+    stop_control_loop.store(true, std::memory_order_release);
+    if (join_before_shutdown.load(std::memory_order_acquire)) join_control_thread();
+  });
+  // A non-lockstep ROS-clock sleep needs context shutdown to wake it; keep
+  // its existing shutdown path rather than joining before that notification.
 
   std::shared_ptr<rclcpp::Executor> executor =
     std::make_shared<rclcpp::executors::MultiThreadedExecutor>();
@@ -61,6 +84,19 @@ int main(int argc, char ** argv)
 
   const bool use_sim_time = cm->get_parameter_or("use_sim_time", false);
   const bool mujoco_lockstep = cm->get_parameter_or("mujoco_lockstep", false);
+  join_before_shutdown.store(mujoco_lockstep || !use_sim_time, std::memory_order_release);
+  const double mujoco_lockstep_wall_time_scale =
+    cm->get_parameter_or("mujoco_lockstep_wall_time_scale", 1.0);
+  if (!mujoco_ros2_control::valid_lockstep_wall_time_scale(
+      mujoco_lockstep_wall_time_scale))
+  {
+    RCLCPP_FATAL(
+      cm->get_logger(),
+      "mujoco_lockstep_wall_time_scale must be finite and at least 1.0; got %.17g",
+      mujoco_lockstep_wall_time_scale);
+    rclcpp::shutdown();
+    return 2;
+  }
 
   const bool has_realtime = realtime_tools::has_realtime_kernel();
   const bool lock_memory = cm->get_parameter_or<bool>("lock_memory", has_realtime);
@@ -75,16 +111,25 @@ int main(int argc, char ** argv)
 
   RCLCPP_INFO(cm->get_logger(), "update rate is %d Hz", cm->get_update_rate());
   RCLCPP_INFO(cm->get_logger(), "MuJoCo lockstep scheduling is %s", mujoco_lockstep ? "enabled" : "disabled");
+  if (mujoco_lockstep)
+  {
+    RCLCPP_INFO(
+      cm->get_logger(),
+      "MuJoCo lockstep wall-time scale is %.3f (simulation/controller period remains unchanged)",
+      mujoco_lockstep_wall_time_scale);
+  }
   const bool manage_overruns = cm->get_parameter_or<bool>("overruns.manage", true);
   RCLCPP_INFO(
     cm->get_logger(), "Overruns handling is : %s", manage_overruns ? "enabled" : "disabled");
   const int thread_priority = cm->get_parameter_or<int>("thread_priority", kSchedPriority);
   RCLCPP_INFO(
-    cm->get_logger(), "Spawning %s RT thread with scheduler priority: %d", cm->get_name(),
+    cm->get_logger(), "Spawning %s control thread with scheduler priority: %d", cm->get_name(),
     thread_priority);
 
-  std::thread cm_thread(
-    [cm, thread_priority, use_sim_time, manage_overruns, mujoco_lockstep]()
+  std::unique_lock<std::mutex> thread_creation_lock(control_thread_mutex);
+  if (!stop_control_loop.load(std::memory_order_acquire)) cm_thread = std::thread(
+    [cm, thread_priority, use_sim_time, manage_overruns, mujoco_lockstep,
+      mujoco_lockstep_wall_time_scale, &stop_control_loop]()
     {
       // portable function that gets now from the cm on humble or later appropriately
       auto get_cm_now = [](const auto& ctrl_mgr) -> rclcpp::Time {
@@ -119,20 +164,23 @@ int main(int argc, char ** argv)
         }
       }
 
-      if (!realtime_tools::configure_sched_fifo(thread_priority))
+      if (thread_priority > 0)
       {
-        RCLCPP_WARN(
-          cm->get_logger(),
-          "Could not enable FIFO RT scheduling policy: with error number <%i>(%s). See "
-          "[https://control.ros.org/master/doc/ros2_control/controller_manager/doc/userdoc.html] "
-          "for details on how to enable realtime scheduling.",
-          errno, strerror(errno));
-      }
-      else
-      {
-        RCLCPP_INFO(
-          cm->get_logger(), "Successful set up FIFO RT scheduling policy with priority %i.",
-          thread_priority);
+        if (!realtime_tools::configure_sched_fifo(thread_priority))
+        {
+          RCLCPP_WARN(
+            cm->get_logger(),
+            "Could not enable FIFO RT scheduling policy: with error number <%i>(%s). See "
+            "[https://control.ros.org/master/doc/ros2_control/controller_manager/doc/userdoc.html] "
+            "for details on how to enable realtime scheduling.",
+            errno, strerror(errno));
+        }
+        else
+        {
+          RCLCPP_INFO(
+            cm->get_logger(), "Successful set up FIFO RT scheduling policy with priority %i.",
+            thread_priority);
+        }
       }
 
       // In lockstep mode the hardware write() call advances MuJoCo exactly
@@ -147,12 +195,17 @@ int main(int argc, char ** argv)
         // readiness barrier for the first update cycle.
         auto readiness_client = cm->create_client<controller_manager_msgs::srv::ListHardwareComponents>(
           "/controller_manager/list_hardware_components");
-        while (rclcpp::ok() && !readiness_client->wait_for_service(100ms))
+        while (!stop_control_loop.load(std::memory_order_acquire) && rclcpp::ok() &&
+               !readiness_client->wait_for_service(100ms))
         {
         }
 
-        const auto period = std::chrono::nanoseconds(1'000'000'000 / cm->get_update_rate());
-        const auto control_period = rclcpp::Duration::from_nanoseconds(period.count());
+        const auto simulated_period =
+          std::chrono::nanoseconds(1'000'000'000 / cm->get_update_rate());
+        const auto wall_period = mujoco_ros2_control::lockstep_wall_period(
+          simulated_period, mujoco_lockstep_wall_time_scale);
+        const auto control_period =
+          rclcpp::Duration::from_nanoseconds(simulated_period.count());
         rclcpp::Time control_time = get_cm_now(cm);
         if (control_time.nanoseconds() == 0)
         {
@@ -162,20 +215,40 @@ int main(int argc, char ** argv)
         }
         auto next_iteration_time = std::chrono::steady_clock::now();
 
-        while (rclcpp::ok())
+        while (!stop_control_loop.load(std::memory_order_acquire) && rclcpp::ok())
         {
+          const auto clock_before_step = get_cm_now(cm);
           cm->read(control_time, control_period);
           cm->update(control_time, control_period);
           cm->write(control_time, control_period);
+          // ControllerManager also consults its trigger clock when deciding
+          // which controllers to update. Wait for this step's /clock delivery
+          // before the next read/update; otherwise a paused solve followed by
+          // fast catch-up can advance physics without a controller update.
+          if (use_sim_time)
+          {
+            const auto clock_deadline = std::chrono::steady_clock::now() + 5s;
+            while (!stop_control_loop.load(std::memory_order_acquire) && rclcpp::ok() &&
+                   get_cm_now(cm) <= clock_before_step)
+            {
+              if (std::chrono::steady_clock::now() >= clock_deadline)
+              {
+                RCLCPP_ERROR(cm->get_logger(), "Lockstep /clock did not advance after physics step");
+                stop_control_loop.store(true, std::memory_order_release);
+                break;
+              }
+              std::this_thread::sleep_for(100us);
+            }
+          }
           control_time = control_time + control_period;
 
-          next_iteration_time += period;
           const auto time_now = std::chrono::steady_clock::now();
-          if (manage_overruns && next_iteration_time < time_now)
+          const auto nominal_deadline = next_iteration_time + wall_period;
+          if (manage_overruns && nominal_deadline < time_now)
           {
             const double overrun_ms =
               static_cast<double>(
-                std::chrono::duration_cast<std::chrono::nanoseconds>(time_now - next_iteration_time).count()) /
+                std::chrono::duration_cast<std::chrono::nanoseconds>(time_now - nominal_deadline).count()) /
               1.e6;
             RCLCPP_WARN_THROTTLE(
               cm->get_logger(), *cm->get_clock(), 1000,
@@ -183,6 +256,8 @@ int main(int argc, char ** argv)
               "real-time factor may temporarily fall below one.",
               overrun_ms);
           }
+          next_iteration_time = mujoco_ros2_control::lockstep_next_wall_deadline(
+            next_iteration_time, time_now, wall_period);
           std::this_thread::sleep_until(next_iteration_time);
         }
         return;
@@ -208,7 +283,7 @@ int main(int argc, char ** argv)
 
       std::chrono::steady_clock::time_point next_iteration_time{std::chrono::steady_clock::now()};
 
-      while (rclcpp::ok())
+      while (!stop_control_loop.load(std::memory_order_acquire) && rclcpp::ok())
       {
         // calculate measured period
         auto const current_time = get_cm_now(cm);
@@ -259,10 +334,13 @@ int main(int argc, char ** argv)
         }
       }
     });
+  thread_creation_lock.unlock();
 
   executor->add_node(cm);
   executor->spin();
-  cm_thread.join();
+  stop_control_loop.store(true, std::memory_order_release);
+  join_control_thread();
   rclcpp::shutdown();
+  context->remove_pre_shutdown_callback(pre_shutdown);
   return 0;
 }

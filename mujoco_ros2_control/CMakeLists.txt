@@ -222,6 +222,9 @@ install(DIRECTORY include/ DESTINATION include)
 
 # Install the ROS 2 control node
 add_executable(ros2_control_node src/mujoco_ros2_control_node.cpp)
+target_include_directories(ros2_control_node PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
 target_link_libraries(ros2_control_node PUBLIC
   controller_manager::controller_manager
   ${controller_manager_msgs_TARGETS}
